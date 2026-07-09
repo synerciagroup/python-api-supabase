@@ -14,11 +14,13 @@ import re
 import unicodedata
 
 import pdfplumber
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from pdfminer.pdfdocument import PDFPasswordIncorrect
+from pdfplumber.utils.exceptions import PdfminerException
 
 app = FastAPI(title="Resumen a Excel API")
 
@@ -90,9 +92,9 @@ def safe_sheet_name(name, used):
 # Extracción de texto del PDF (ahora desde bytes en memoria, no un path)
 # --------------------------------------------------------------------------
 
-def extract_lines(pdf_file):
+def extract_lines(pdf_file, password=None):
     lines = []
-    with pdfplumber.open(pdf_file) as pdf:
+    with pdfplumber.open(pdf_file, password=password or "") as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
             lines.extend(text.split("\n"))
@@ -444,9 +446,9 @@ def build_workbook(personas, otros):
 # Orquestación (ahora trabaja 100% en memoria, sin tocar disco)
 # --------------------------------------------------------------------------
 
-def process_pdf_bytes(pdf_bytes, original_filename):
+def process_pdf_bytes(pdf_bytes, original_filename, password=None):
     pdf_file = io.BytesIO(pdf_bytes)
-    lines = extract_lines(pdf_file)
+    lines = extract_lines(pdf_file, password=password)
     full_text = "\n".join(lines)
 
     bank, card = detect_bank_and_card(full_text)
@@ -495,7 +497,7 @@ def health_check():
 
 
 @app.post("/convertir")
-async def convertir(file: UploadFile = File(...)):
+async def convertir(file: UploadFile = File(...), password: str = Form(None)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="El archivo debe ser un PDF")
 
@@ -504,7 +506,15 @@ async def convertir(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="El archivo está vacío")
 
     try:
-        nombre_archivo, excel_bytes = process_pdf_bytes(pdf_bytes, file.filename)
+        nombre_archivo, excel_bytes = process_pdf_bytes(pdf_bytes, file.filename, password=password)
+    except PdfminerException as e:
+        # Si la causa es contraseña faltante/incorrecta, devolvemos un error
+        # específico (401) para que la app pueda pedirle la clave al usuario.
+        if e.args and isinstance(e.args[0], PDFPasswordIncorrect):
+            if password:
+                raise HTTPException(status_code=401, detail="password_incorrect")
+            raise HTTPException(status_code=401, detail="password_required")
+        raise HTTPException(status_code=500, detail=f"Error al leer el PDF: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al procesar el PDF: {e}")
 
