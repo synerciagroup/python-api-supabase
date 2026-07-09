@@ -433,6 +433,24 @@ def build_workbook(personas, otros):
     return wb
 
 
+def build_download_filename(bank, mes_nombre, anio, original_filename):
+    """Ej: resumen macro julio.xlsx"""
+    labels = {
+        "BBVA": "bbva",
+        "BancoNacion": "banco nacion",
+        "Macro": "macro",
+        "Banco": "banco",
+    }
+    bank_label = labels.get(bank, bank.lower())
+    if mes_nombre:
+        name = f"resumen {bank_label} {mes_nombre.lower()}"
+    else:
+        stem = os.path.splitext(os.path.basename(original_filename))[0]
+        name = f"resumen {bank_label} {stem}" if stem else f"resumen {bank_label}"
+    name = re.sub(r'[\\/:*?"<>|]', "_", name).strip()
+    return f"{name}.xlsx"
+
+
 def process_pdf_bytes(pdf_bytes, original_filename, password=None):
     pdf_file = io.BytesIO(pdf_bytes)
     lines = extract_lines(pdf_file, password=password)
@@ -454,16 +472,9 @@ def process_pdf_bytes(pdf_bytes, original_filename, password=None):
         if not personas:
             personas, otros = group_bbva(lines)
 
-    nombre_partes = [bank]
-    if card:
-        nombre_partes.append(card)
-    if mes_nombre and anio:
-        nombre_partes.append(f"{mes_nombre}{anio}")
-    else:
-        nombre_partes.append(os.path.splitext(original_filename)[0])
-
-    nombre_archivo = "_".join(nombre_partes) + ".xlsx"
-    nombre_archivo = re.sub(r"[^\w\-.]", "_", nombre_archivo)
+    nombre_archivo = build_download_filename(
+        bank, mes_nombre, anio, original_filename
+    )
 
     wb = build_workbook(personas, otros)
 
