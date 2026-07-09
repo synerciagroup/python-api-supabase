@@ -6,6 +6,7 @@ Recibe un PDF de resumen de tarjeta (BBVA, Banco Nación, Macro) por HTTP
 y devuelve el Excel resultante como descarga directa.
 
 Endpoint principal: POST /convertir  (multipart/form-data, campo "file")
+Seguridad: header X-API-Key (variable de entorno API_KEY_APP en Render)
 """
 
 import io
@@ -14,7 +15,7 @@ import re
 import unicodedata
 
 import pdfplumber
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -23,6 +24,16 @@ from pdfminer.pdfdocument import PDFPasswordIncorrect
 from pdfplumber.utils.exceptions import PdfminerException
 
 app = FastAPI(title="Resumen a Excel API")
+
+API_KEY = os.environ.get("API_KEY_APP", "").strip() or os.environ.get("API_KEY", "").strip()
+
+
+def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+    if not API_KEY:
+        return
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="API key inválida.")
+
 
 # --------------------------------------------------------------------------
 # Utilidades generales (idéntico al script original)
@@ -88,10 +99,6 @@ def safe_sheet_name(name, used):
     return name
 
 
-# --------------------------------------------------------------------------
-# Extracción de texto del PDF (ahora desde bytes en memoria, no un path)
-# --------------------------------------------------------------------------
-
 def extract_lines(pdf_file, password=None):
     lines = []
     with pdfplumber.open(pdf_file, password=password or "") as pdf:
@@ -100,10 +107,6 @@ def extract_lines(pdf_file, password=None):
             lines.extend(text.split("\n"))
     return lines
 
-
-# --------------------------------------------------------------------------
-# Detección de banco / tarjeta / período
-# --------------------------------------------------------------------------
 
 def detect_bank_and_card(full_text):
     up = full_text.upper()
@@ -150,10 +153,6 @@ def detect_period(full_text):
                 return anio, mes_num, mes_nombre
     return None, None, None
 
-
-# --------------------------------------------------------------------------
-# Parseo de renglones de transacciones
-# --------------------------------------------------------------------------
 
 def match_date_prefix(line):
     for rgx in DATE_STYLES:
@@ -258,10 +257,6 @@ def parse_line(line, cupon_style):
         "dolares": dolares,
     }
 
-
-# --------------------------------------------------------------------------
-# Estrategias de agrupado por persona
-# --------------------------------------------------------------------------
 
 def group_bbva(lines):
     personas = {}
@@ -375,10 +370,6 @@ def group_nacion_mastercard(lines):
     return personas, otros
 
 
-# --------------------------------------------------------------------------
-# Escritura del Excel
-# --------------------------------------------------------------------------
-
 HEADER_FILL = PatternFill("solid", start_color="1F4E78", end_color="1F4E78")
 HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF")
 BODY_FONT = Font(name="Arial", size=10)
@@ -442,10 +433,6 @@ def build_workbook(personas, otros):
     return wb
 
 
-# --------------------------------------------------------------------------
-# Orquestación (ahora trabaja 100% en memoria, sin tocar disco)
-# --------------------------------------------------------------------------
-
 def process_pdf_bytes(pdf_bytes, original_filename, password=None):
     pdf_file = io.BytesIO(pdf_bytes)
     lines = extract_lines(pdf_file, password=password)
@@ -484,12 +471,9 @@ def process_pdf_bytes(pdf_bytes, original_filename, password=None):
     wb.save(output)
     output.seek(0)
 
-    return nombre_archivo, output
+    total_rows = sum(len(r) for r in personas.values()) + len(otros)
+    return nombre_archivo, output, len(personas), total_rows
 
-
-# --------------------------------------------------------------------------
-# Endpoints
-# --------------------------------------------------------------------------
 
 @app.get("/")
 def health_check():
@@ -497,7 +481,13 @@ def health_check():
 
 
 @app.post("/convertir")
-async def convertir(file: UploadFile = File(...), password: str = Form(None)):
+async def convertir(
+    file: UploadFile = File(...),
+    password: str = Form(None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    require_api_key(x_api_key)
+
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="El archivo debe ser un PDF")
 
@@ -506,10 +496,10 @@ async def convertir(file: UploadFile = File(...), password: str = Form(None)):
         raise HTTPException(status_code=400, detail="El archivo está vacío")
 
     try:
-        nombre_archivo, excel_bytes = process_pdf_bytes(pdf_bytes, file.filename, password=password)
+        nombre_archivo, excel_bytes, person_count, row_count = process_pdf_bytes(
+            pdf_bytes, file.filename, password=password
+        )
     except PdfminerException as e:
-        # Si la causa es contraseña faltante/incorrecta, devolvemos un error
-        # específico (401) para que la app pueda pedirle la clave al usuario.
         if e.args and isinstance(e.args[0], PDFPasswordIncorrect):
             if password:
                 raise HTTPException(status_code=401, detail="password_incorrect")
@@ -521,5 +511,10 @@ async def convertir(file: UploadFile = File(...), password: str = Form(None)):
     return StreamingResponse(
         excel_bytes,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{nombre_archivo}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{nombre_archivo}"',
+            "X-Output-Filename": nombre_archivo,
+            "X-Person-Count": str(person_count),
+            "X-Row-Count": str(row_count),
+        },
     )
